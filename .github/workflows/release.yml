@@ -13,8 +13,10 @@ permissions:
 
 jobs:
   lint:
+    # Only run the fast lint/test on direct pushes and PRs.
+    # The release event uses the 'build' job (with the full matrix) to produce artifacts.
     runs-on: ubuntu-latest
-    if: github.event_name != 'release'   # release event will run the full build job only
+    if: github.event_name != 'release'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
