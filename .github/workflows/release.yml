@@ -12,36 +12,6 @@ permissions:
   contents: write
 
 jobs:
-  lint:
-    # Only run the fast lint/test on direct pushes and PRs.
-    # The release event uses the 'build' job (with the full matrix) to produce artifacts.
-    runs-on: ubuntu-latest
-    if: github.event_name != 'release'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-
-      - name: Lint and unit tests (race, cover, vet, fmt)
-        run: |
-          echo "=== gofmt ==="
-          if gofmt -l . | grep -q .; then
-            echo "FAIL: some files need gofmt"
-            gofmt -l .
-            exit 1
-          fi
-          echo "=== go vet ==="
-          go vet ./...
-          echo "=== go test -race + cover ==="
-          go test -race -coverprofile=coverage.out -count=1 ./...
-          echo "Coverage:"
-          go tool cover -func=coverage.out | tail -5
-          echo "Lint + tests passed"
-
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -75,6 +45,23 @@ jobs:
         with:
           go-version: "1.24"
 
+      - name: Lint and unit tests (race, cover, vet, fmt) - native only
+        if: matrix.os == 'linux' && matrix.arch == 'amd64'
+        run: |
+          echo "=== gofmt ==="
+          if gofmt -l . | grep -q .; then
+            echo "FAIL: some files need gofmt"
+            gofmt -l .
+            exit 1
+          fi
+          echo "=== go vet ==="
+          go vet ./...
+          echo "=== go test -race + cover ==="
+          go test -race -coverprofile=coverage.out -count=1 ./...
+          echo "Coverage:"
+          go tool cover -func=coverage.out | tail -5
+          echo "Lint + tests passed (linux/amd64)"
+
       - name: Determine version for this build
         id: ver
         run: |
@@ -97,7 +84,7 @@ jobs:
           ls -l "$BINARY"
           file "$BINARY"
 
-          # Fail if binary is suspiciously small (< 1MB for a Go binary with zstd)
+          # Fail if binary is suspiciously small (< 1MB for a Go binary)
           SIZE=$(stat -c%s "$BINARY" 2>/dev/null || stat -f%z "$BINARY")
           if [ "$SIZE" -lt 1000000 ]; then
             echo "ERROR: Binary too small ($SIZE bytes) - build likely failed"
