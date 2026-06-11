@@ -6,12 +6,14 @@
 *.dylib
 go-bkp
 backup-go
+go-bkp-*
 
 # Test binary, built with `go test -c`
 *.test
 
 # Output of the go coverage tool
 *.out
+coverage.out
 
 # Go workspace file
 go.work
@@ -28,4 +30,8 @@ go.work
 ses
 
 go-bkp-linux
-go-bkp-*
+
+# Note: committed binaries (go-bkp, go-bkp-linux) that may exist in the tree
+# from prior development should be removed with:
+#   git rm --cached go-bkp go-bkp-linux
+# (they are now covered by the go-bkp-* and explicit rules above).

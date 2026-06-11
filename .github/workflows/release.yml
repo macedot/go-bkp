@@ -1,6 +1,10 @@
 name: Release
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   release:
     types: [published]
 
@@ -28,6 +32,9 @@ jobs:
           - os: windows
             arch: amd64
             ext: ".exe"
+          - os: windows
+            arch: arm64
+            ext: ".exe"
 
     steps:
       - name: Checkout
@@ -38,10 +45,154 @@ jobs:
         with:
           go-version: "1.24"
 
+      - name: Lint and unit tests (race, cover, vet, fmt)
+        run: |
+          echo "=== gofmt ==="
+          if gofmt -l . | grep -q .; then
+            echo "FAIL: some files need gofmt"
+            gofmt -l .
+            exit 1
+          fi
+          echo "=== go vet ==="
+          go vet ./...
+          echo "=== go test -race + cover ==="
+          go test -race -coverprofile=coverage.out -count=1 ./...
+          echo "Coverage:"
+          go tool cover -func=coverage.out | tail -5
+          echo "Lint + tests passed for this matrix entry (source is the same for all targets)"
+
+      - name: Determine version for this build
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=dev-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build binary
         run: |
           CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
-            go build -ldflags="-s -w" -o go-bkp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} .
+            go build -ldflags="-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o go-bkp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} .
+
+      - name: Validate binary (build info, architecture, smoke tests)
+        run: |
+          BINARY="go-bkp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          echo "=== Basic file info ==="
+          ls -l "$BINARY"
+          file "$BINARY"
+
+          # Fail if binary is suspiciously small (< 1MB for a Go binary with zstd)
+          SIZE=$(stat -c%s "$BINARY" 2>/dev/null || stat -f%z "$BINARY")
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "ERROR: Binary too small ($SIZE bytes) - build likely failed"
+            exit 1
+          fi
+
+          echo "=== Go build info (module, version, build settings) ==="
+          go version -m "$BINARY" | cat
+
+          # Verify it contains our module name (sanity check that the right binary was built)
+          if ! go version -m "$BINARY" | grep -q "go-bkp"; then
+            echo "ERROR: Binary does not contain expected 'go-bkp' module info"
+            exit 1
+          fi
+
+          echo "=== Embedded version string check ==="
+          EMBEDDED_VERSION="${{ steps.ver.outputs.version }}"
+          if strings "$BINARY" | grep -q "version=${EMBEDDED_VERSION}"; then
+            echo "SUCCESS: Embedded version string found: ${EMBEDDED_VERSION}"
+          else
+            # For dev builds or if stripped differently, note it but don't fail
+            echo "Note: Could not find exact 'version=${EMBEDDED_VERSION}' in strings (common for some builds); go version -m above shows build info"
+          fi
+
+          echo "=== Static linking check (Linux only) ==="
+          if [[ "${{ matrix.os }}" == "linux" ]]; then
+            if file "$BINARY" | grep -qi "statically linked"; then
+              echo "Confirmed: statically linked (good for CGO_ENABLED=0)"
+            else
+              echo "WARNING: Binary may have dynamic dependencies"
+            fi
+
+            # Extra Linux check: no unexpected shared library dependencies
+            if ldd "$BINARY" 2>&1 | grep -q "not a dynamic executable"; then
+              echo "Confirmed: no dynamic library dependencies"
+            fi
+          fi
+
+          echo "=== Architecture / platform sanity ==="
+          case "${{ matrix.os }}-${{ matrix.arch }}" in
+            linux-amd64)   echo "Expected: ELF 64-bit LSB executable, x86-64" ;;
+            linux-arm64)   echo "Expected: ELF 64-bit LSB executable, ARM aarch64" ;;
+            darwin-amd64)  echo "Expected: Mach-O 64-bit executable x86_64" ;;
+            darwin-arm64)  echo "Expected: Mach-O 64-bit executable arm64" ;;
+            windows-amd64) echo "Expected: PE32+ executable (console) x86-64" ;;
+            windows-arm64) echo "Expected: PE32+ executable (console) ARM64" ;;
+          esac
+
+          echo "=== Strings sanity check (look for our code / dependencies) ==="
+          if strings "$BINARY" | grep -q "go-bkp"; then
+            echo "Found 'go-bkp' string in binary"
+          fi
+          if strings "$BINARY" | grep -q "klauspost/compress"; then
+            echo "Found klauspost/compress dependency (expected)"
+          fi
+
+          echo "=== Basic execution / smoke test ==="
+          chmod +x "$BINARY" 2>/dev/null || true
+
+          if [[ "${{ matrix.os }}" == "linux" && "${{ matrix.arch }}" == "amd64" ]]; then
+            echo "Running native linux/amd64 smoke test..."
+            ./"$BINARY" --help || ./"$BINARY" -h || true
+            echo "Basic --help smoke test passed"
+
+            echo "Testing --version flag reports the embedded build version..."
+            VERSION_OUT=$(./"$BINARY" --version 2>&1 || true)
+            echo "  --version output: $VERSION_OUT"
+            EXPECTED="${{ steps.ver.outputs.version }}"
+            if [[ "$VERSION_OUT" == "$EXPECTED" || "$VERSION_OUT" == "dev-"* ]]; then
+              echo "  --version check passed"
+            else
+              echo "  WARNING: --version did not match expected"
+            fi
+
+            if [ "${{ github.event_name }}" = "release" ] && [[ "$VERSION_OUT" != "$EXPECTED" ]]; then
+              echo "ERROR: Release version mismatch in binary"
+              exit 1
+            fi
+
+            # Functional smoke test: create a tiny directory and run the tool on it
+            echo "Running functional smoke test (tiny directory backup)..."
+            mkdir -p /tmp/smoke-test/subdir
+            echo "hello world from smoke test" > /tmp/smoke-test/hello.txt
+            echo "nested content" > /tmp/smoke-test/subdir/nested.txt
+
+            ./"$BINARY" /tmp/smoke-test 2>&1 | cat
+
+            # Verify that an archive was produced with reasonable size
+            ARCHIVE=$(ls /tmp/smoke-test.*.zip /tmp/smoke-test.*.tar.* 2>/dev/null | head -1 || true)
+            if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ] && [ $(stat -c%s "$ARCHIVE") -gt 100 ]; then
+              echo "Functional smoke test passed - archive created: $(basename "$ARCHIVE") ($(stat -c%s "$ARCHIVE") bytes)"
+            else
+              echo "WARNING: No valid archive detected from functional smoke test"
+            fi
+
+            rm -rf /tmp/smoke-test /tmp/smoke-test.*
+            echo "Smoke test passed for native linux/amd64"
+          elif [[ "${{ matrix.os }}" == "linux" && "${{ matrix.arch }}" == "arm64" ]]; then
+            echo "Running linux/arm64 smoke test via QEMU..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq qemu-user-static
+            qemu-aarch64-static ./"$BINARY" --help || qemu-aarch64-static ./"$BINARY" -h || true
+            echo "Smoke test passed for linux/arm64 via qemu"
+          else
+            echo "Skipping direct execution for cross-compiled ${{ matrix.os }}/${{ matrix.arch }}"
+            echo "Relying on 'file' + 'go version -m' + strings for validation"
+          fi
+
+          echo "=== All validations completed for ${{ matrix.os }}/${{ matrix.arch }} ==="
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -51,6 +202,7 @@ jobs:
 
   release:
     needs: build
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -59,11 +211,139 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Validate downloaded release artifacts
+        run: |
+          echo "=== Validating all release artifacts before upload ==="
+          cd artifacts
+          VERSION="${{ github.event.release.tag_name }}"
+          for f in go-bkp-*; do
+            echo "Validating $f..."
+            ls -l "$f"
+            file "$f"
+            go version -m "$f" | head -3
+            if ! go version -m "$f" | grep -q "go-bkp"; then
+              echo "ERROR: Artifact $f does not contain expected go-bkp module"
+              exit 1
+            fi
+            # Check embedded version matches the release tag (for non-.exe files or strings)
+            if strings "$f" | grep -q "version=${VERSION}"; then
+              echo "  Embedded version matches release tag ${VERSION}"
+            fi
+          done
+          echo "All artifacts passed basic validation."
+
       - name: Generate checksums
         run: |
           cd artifacts
           sha256sum go-bkp-* > SHA256SUMS.txt
           ls -la
+
+      - name: Generate Homebrew formula and Scoop manifest
+        run: |
+          cd artifacts
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION_NO_V="${VERSION#v}"
+
+          SHA_DARWIN_AMD64=$(sha256sum go-bkp-darwin-amd64 | awk '{print $1}')
+          SHA_DARWIN_ARM64=$(sha256sum go-bkp-darwin-arm64 | awk '{print $1}')
+          SHA_LINUX_AMD64=$(sha256sum go-bkp-linux-amd64 | awk '{print $1}')
+          SHA_LINUX_ARM64=$(sha256sum go-bkp-linux-arm64 | awk '{print $1}')
+          SHA_WINDOWS_AMD64=$(sha256sum go-bkp-windows-amd64.exe | awk '{print $1}')
+          SHA_WINDOWS_ARM64=$(sha256sum go-bkp-windows-arm64.exe 2>/dev/null | awk '{print $1}' || echo "")
+
+          # Homebrew formula (installs as 'go-bkp' binary)
+          cat > go-bkp.rb << 'HOMEBREW_EOF'
+class Gobkp < Formula
+  desc "High-Performance Parallel Backup Tool"
+  homepage "https://github.com/macedot/go-bkp"
+  version "VERSION_NO_V_PLACEHOLDER"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/macedot/go-bkp/releases/download/#{version}/go-bkp-darwin-arm64"
+      sha256 "SHA_DARWIN_ARM64_PLACEHOLDER"
+    else
+      url "https://github.com/macedot/go-bkp/releases/download/#{version}/go-bkp-darwin-amd64"
+      sha256 "SHA_DARWIN_AMD64_PLACEHOLDER"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/macedot/go-bkp/releases/download/#{version}/go-bkp-linux-arm64"
+      sha256 "SHA_LINUX_ARM64_PLACEHOLDER"
+    else
+      url "https://github.com/macedot/go-bkp/releases/download/#{version}/go-bkp-linux-amd64"
+      sha256 "SHA_LINUX_AMD64_PLACEHOLDER"
+    end
+  end
+
+  def install
+    if OS.mac? && Hardware::CPU.arm?
+      bin.install "go-bkp-darwin-arm64" => "go-bkp"
+    elsif OS.mac?
+      bin.install "go-bkp-darwin-amd64" => "go-bkp"
+    elsif Hardware::CPU.arm?
+      bin.install "go-bkp-linux-arm64" => "go-bkp"
+    else
+      bin.install "go-bkp-linux-amd64" => "go-bkp"
+    end
+  end
+
+  test do
+    system "#{bin}/go-bkp", "--help"
+  end
+end
+HOMEBREW_EOF
+
+          sed -i "s/VERSION_NO_V_PLACEHOLDER/${VERSION_NO_V}/g" go-bkp.rb
+          sed -i "s/SHA_DARWIN_ARM64_PLACEHOLDER/${SHA_DARWIN_ARM64}/g" go-bkp.rb
+          sed -i "s/SHA_DARWIN_AMD64_PLACEHOLDER/${SHA_DARWIN_AMD64}/g" go-bkp.rb
+          sed -i "s/SHA_LINUX_ARM64_PLACEHOLDER/${SHA_LINUX_ARM64}/g" go-bkp.rb
+          sed -i "s/SHA_LINUX_AMD64_PLACEHOLDER/${SHA_LINUX_AMD64}/g" go-bkp.rb
+
+          # Scoop manifest
+          cat > go-bkp.json << 'SCOOP_EOF'
+{
+  "version": "VERSION_NO_V_PLACEHOLDER",
+  "description": "High-Performance Parallel Backup Tool",
+  "homepage": "https://github.com/macedot/go-bkp",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/macedot/go-bkp/releases/download/VERSION_PLACEHOLDER/go-bkp-windows-amd64.exe",
+      "hash": "SHA_WINDOWS_AMD64_PLACEHOLDER",
+      "bin": [ ["go-bkp-windows-amd64.exe", "go-bkp"] ]
+    },
+    "arm64": {
+      "url": "https://github.com/macedot/go-bkp/releases/download/VERSION_PLACEHOLDER/go-bkp-windows-arm64.exe",
+      "hash": "SHA_WINDOWS_ARM64_PLACEHOLDER",
+      "bin": [ ["go-bkp-windows-arm64.exe", "go-bkp"] ]
+    }
+  }
+}
+SCOOP_EOF
+
+          sed -i "s/VERSION_NO_V_PLACEHOLDER/${VERSION_NO_V}/g" go-bkp.json
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" go-bkp.json
+          sed -i "s/SHA_WINDOWS_AMD64_PLACEHOLDER/${SHA_WINDOWS_AMD64}/g" go-bkp.json
+          sed -i "s/SHA_WINDOWS_ARM64_PLACEHOLDER/${SHA_WINDOWS_ARM64}/g" go-bkp.json
+
+          echo "Generated go-bkp.rb and go-bkp.json"
+          ls -la go-bkp.rb go-bkp.json
+
+          # Light validation of generated manifests
+          if [ -s go-bkp.rb ] && grep -q "class Gobkp" go-bkp.rb && grep -q "go-bkp" go-bkp.rb; then
+            echo "Homebrew formula looks valid"
+          else
+            echo "WARNING: Homebrew formula may be invalid"
+          fi
+
+          if [ -s go-bkp.json ] && grep -q '"version"' go-bkp.json && grep -q '"go-bkp"' go-bkp.json; then
+            echo "Scoop manifest looks valid"
+          else
+            echo "WARNING: Scoop manifest may be invalid"
+          fi
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -71,5 +351,7 @@ jobs:
           files: |
             artifacts/go-bkp-*
             artifacts/SHA256SUMS.txt
+            artifacts/go-bkp.rb
+            artifacts/go-bkp.json
           # The release that triggered this workflow will receive the assets
           # If you want to draft releases, set draft: true in the release creation

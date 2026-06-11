@@ -9,15 +9,23 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	kzip "github.com/klauspost/compress/zip"
 	"github.com/klauspost/compress/flate"
+	kzip "github.com/klauspost/compress/zip"
 )
+
+var version = "dev"
+
+// version is overridden at build time via -ldflags:
+//   -ldflags="-X main.version=${TAG_OR_SHA}"
+// See .github/workflows/release.yml for the injection used in CI/release.
 
 // go-bkp is a clean, modern Go port of backup.sh.
 // - Directories → single <name>.<timestamp>.zip using parallel compression (klauspost zip + flate)
@@ -33,6 +41,7 @@ func main() {
 	queueWorkers := flag.Int("q", 1, "number of top-level items (files/folders) to process in parallel from the queue")
 	coresPerJob := flag.Int("c", 0, "cores to allocate per job for reading + compression (0 = auto: total/queue)")
 	decompress := flag.Bool("d", false, "decompress mode: extract the provided .zip archive files")
+	showVersion := flag.Bool("version", false, "print version and exit")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <file|directory> [file|directory] ...\n\n", os.Args[0])
@@ -44,8 +53,22 @@ func main() {
 
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
+
 	if len(flag.Args()) == 0 {
 		flag.Usage()
+		os.Exit(2)
+	}
+
+	if *queueWorkers < 1 {
+		fmt.Fprintf(os.Stderr, "Error: -q must be >= 1\n")
+		os.Exit(2)
+	}
+	if *coresPerJob < 0 {
+		fmt.Fprintf(os.Stderr, "Error: -c must be >= 0\n")
 		os.Exit(2)
 	}
 
@@ -64,11 +87,11 @@ func main() {
 
 	ts := time.Now().Format("20060102150405")
 
-	// Create a cancellable context (useful for future signal handling / graceful shutdown).
+	// Context with signal cancellation for graceful shutdown (Ctrl-C / SIGTERM).
 	// Note: We intentionally do *not* cancel on per-job failures so that other
-	// backups can continue (partial progress is allowed).
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// backups can continue (partial progress is allowed, per requirements).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// Create work queue
 	jobs := make(chan string, len(targets))
@@ -114,7 +137,7 @@ func main() {
 	os.Exit(lastError)
 }
 
-func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int) error {
+func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int) (err error) {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -126,12 +149,12 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 		input = "."
 	}
 
-	info, err := os.Stat(input)
-	if os.IsNotExist(err) {
+	info, statErr := os.Stat(input)
+	if os.IsNotExist(statErr) {
 		return fmt.Errorf("not found: %s", input)
 	}
-	if err != nil {
-		return err
+	if statErr != nil {
+		return statErr
 	}
 
 	base := filepath.Base(input)
@@ -147,8 +170,8 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 			outPath = filepath.Join(dir, base+"."+ts)
 		}
 		fmt.Printf("Backing up: %s (%s) -> %s (copy)\n", input, humanSize(info.Size()), outPath)
-		if err := copyFileWithTimestamp(input, outPath, info); err != nil {
-			return err
+		if cErr := copyFileWithTimestamp(input, outPath, info); cErr != nil {
+			return cErr
 		}
 		fmt.Printf("Done: %s\n\n", outPath)
 		return nil
@@ -163,10 +186,13 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 	orig := calculateSize(input)
 	fmt.Printf("Backing up: %s (%s) -> %s\n", input, humanSize(orig), outPath)
 
-	outFile, err := os.Create(outPath)
-	if err != nil {
-		return err
+	outFile, createErr := os.Create(outPath)
+	if createErr != nil {
+		return createErr
 	}
+	// Named return 'err' + explicit assignment on error paths below ensure the
+	// defer always observes a non-nil err for the partial-file cleanup.
+	// This fixes the previous bug where the closure only saw the (nil) Create err.
 	defer func() {
 		outFile.Close()
 		if err != nil {
@@ -184,11 +210,13 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 	// Parallel read + compress into zip
 	if addErr := addToZip(zw, input, base, verbose, coresPerJob); addErr != nil {
 		zw.Close()
-		return addErr
+		err = addErr
+		return
 	}
 
 	if zerr := zw.Close(); zerr != nil {
-		return zerr
+		err = zerr
+		return
 	}
 
 	var compSize int64
@@ -287,7 +315,13 @@ func addToZip(zw *kzip.Writer, sourcePath, archiveBase string, verbose bool, cor
 			}
 			for _, e := range ents {
 				full := filepath.Join(dir, e.Name())
-				rel, _ := filepath.Rel(sourcePath, full)
+				rel, relErr := filepath.Rel(sourcePath, full)
+				if relErr != nil {
+					// Extremely rare (e.g. cross-device or weird fs); treat as fatal for this entry
+					// so the overall backup fails with a clear cause instead of a mysterious empty rel.
+					results <- result{err: fmt.Errorf("rel path for %s: %w", full, relErr)}
+					continue
+				}
 				if e.IsDir() {
 					walkWG.Add(1)
 					go walkDir(full)
@@ -334,6 +368,8 @@ func addToZip(zw *kzip.Writer, sourcePath, archiveBase string, verbose bool, cor
 
 func calculateSize(path string) int64 {
 	var total int64
+	// Best-effort size for the progress banner only. Errors (permission, etc.)
+	// are silently ignored here; the real backup walk will surface real read errors.
 	filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
 			if info, e := d.Info(); e == nil {
@@ -381,7 +417,14 @@ func copyFileWithTimestamp(src, dst string, info os.FileInfo) error {
 
 // extractZip extracts a standard .zip archive to the current directory.
 // It logs errors for individual files but continues to the next file in the archive.
+// (Thin wrapper for CLI; see extractZipTo for tests that need an explicit safe root.)
 func extractZip(archivePath string, verbose bool) error {
+	return extractZipTo(archivePath, ".", verbose)
+}
+
+// extractZipTo extracts to a caller-controlled destination root (must be a directory).
+// This enables safe, isolated testing of the extract path and the zip-slip guards.
+func extractZipTo(archivePath, dest string, verbose bool) error {
 	r, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return fmt.Errorf("failed to open zip %s: %w", archivePath, err)
@@ -389,30 +432,43 @@ func extractZip(archivePath string, verbose bool) error {
 	defer r.Close()
 
 	for _, f := range r.File {
-		if err := extractZipFile(f, verbose); err != nil {
+		if err := extractZipFileTo(f, dest, verbose); err != nil {
 			fmt.Fprintf(os.Stderr, "Error extracting %s from %s: %v\n", f.Name, archivePath, err)
-			// continue to next file
+			// continue to next file (partial progress)
 		}
 	}
 	return nil
 }
 
-func extractZipFile(f *zip.File, verbose bool) error {
-	// Prevent zip slip
-	if strings.Contains(f.Name, "..") {
-		return fmt.Errorf("refusing to extract path with .. : %s", f.Name)
+func extractZipFileTo(f *zip.File, dest string, verbose bool) error {
+	// Strong zip-slip prevention for untrusted archives in -d mode.
+	// Reject absolute paths and any traversal that would escape the destination root.
+	name := f.Name
+	if filepath.IsAbs(name) {
+		return fmt.Errorf("refusing to extract absolute path: %s", name)
+	}
+	clean := filepath.Clean(name)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to extract path with .. traversal: %s", name)
 	}
 
 	if verbose {
 		fmt.Println(f.Name)
 	}
 
-	// Create directories if needed
-	if f.FileInfo().IsDir() {
-		return os.MkdirAll(f.Name, f.FileInfo().Mode())
+	// Compute a safe target under dest and double-check it does not escape.
+	target := filepath.Join(dest, name)
+	// After join, the target must have dest as prefix (accounting for separator).
+	if !strings.HasPrefix(target, dest+string(filepath.Separator)) && target != dest {
+		return fmt.Errorf("refusing to extract path that escapes destination: %s", name)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(f.Name), 0755); err != nil {
+	// Create directories if needed
+	if f.FileInfo().IsDir() {
+		return os.MkdirAll(target, f.FileInfo().Mode())
+	}
+
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return err
 	}
 
@@ -422,7 +478,7 @@ func extractZipFile(f *zip.File, verbose bool) error {
 	}
 	defer rc.Close()
 
-	out, err := os.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
+	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
 	if err != nil {
 		return err
 	}
@@ -430,6 +486,11 @@ func extractZipFile(f *zip.File, verbose bool) error {
 
 	_, err = io.Copy(out, rc)
 	return err
+}
+
+// Backward-compatible wrapper used by the non-To path (and old call sites).
+func extractZipFile(f *zip.File, verbose bool) error {
+	return extractZipFileTo(f, ".", verbose)
 }
 
 // shouldStoreRaw returns true for file types that are typically already compressed
