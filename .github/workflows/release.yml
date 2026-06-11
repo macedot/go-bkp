@@ -12,6 +12,34 @@ permissions:
   contents: write
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'release'   # release event will run the full build job only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Lint and unit tests (race, cover, vet, fmt)
+        run: |
+          echo "=== gofmt ==="
+          if gofmt -l . | grep -q .; then
+            echo "FAIL: some files need gofmt"
+            gofmt -l .
+            exit 1
+          fi
+          echo "=== go vet ==="
+          go vet ./...
+          echo "=== go test -race + cover ==="
+          go test -race -coverprofile=coverage.out -count=1 ./...
+          echo "Coverage:"
+          go tool cover -func=coverage.out | tail -5
+          echo "Lint + tests passed"
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -44,22 +72,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-
-      - name: Lint and unit tests (race, cover, vet, fmt)
-        run: |
-          echo "=== gofmt ==="
-          if gofmt -l . | grep -q .; then
-            echo "FAIL: some files need gofmt"
-            gofmt -l .
-            exit 1
-          fi
-          echo "=== go vet ==="
-          go vet ./...
-          echo "=== go test -race + cover ==="
-          go test -race -coverprofile=coverage.out -count=1 ./...
-          echo "Coverage:"
-          go tool cover -func=coverage.out | tail -5
-          echo "Lint + tests passed for this matrix entry (source is the same for all targets)"
 
       - name: Determine version for this build
         id: ver
