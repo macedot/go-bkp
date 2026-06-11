@@ -1,7 +1,8 @@
 package main
 
 import (
-	"archive/tar"
+	"archive/zip"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -14,26 +15,31 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	kzip "github.com/klauspost/compress/zip"
+	"github.com/klauspost/compress/flate"
 )
 
 // go-bkp is a clean, modern Go port of backup.sh.
-// - Directories → single <name>.<timestamp>.tar.zst (parallel read + zstd)
+// - Directories → single <name>.<timestamp>.zip using parallel compression (klauspost zip + flate)
 // - Single files  → timestamped copy (original behavior)
 //
-// Pure Go only. No external tools. Standard .tar.zst output.
+// Supports list of files/folders processed via parallel queue (-q workers, -c cores per job).
+// -d for decompress mode (extracts list of .zip files, logs errors per item and continues).
+// Pure Go only. No external tools. Standard .zip output (directly usable with unzip/7z etc.).
 
 func main() {
 	verbose := flag.Bool("v", false, "verbose output (list files)")
 
 	queueWorkers := flag.Int("q", 1, "number of top-level items (files/folders) to process in parallel from the queue")
 	coresPerJob := flag.Int("c", 0, "cores to allocate per job for reading + compression (0 = auto: total/queue)")
+	decompress := flag.Bool("d", false, "decompress mode: extract the provided .zip archive files")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <file|directory> [file|directory] ...\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nIf no targets are provided, this usage message is printed.\n")
+		fmt.Fprintf(os.Stderr, "\nIn -d mode, arguments are treated as .zip files to extract (errors per file are logged, processing continues).\n")
 	}
 
 	flag.Parse()
@@ -86,7 +92,14 @@ func main() {
 				default:
 				}
 
-				if err := backup(ctx, target, ts, *verbose, *coresPerJob); err != nil {
+				var err error
+				if *decompress {
+					err = extractZip(target, *verbose)
+				} else {
+					err = backup(ctx, target, ts, *verbose, *coresPerJob)
+				}
+
+				if err != nil {
 					mu.Lock()
 					lastError = 1
 					wrapped := wrapTargetError(target, err)
@@ -141,10 +154,10 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 		return nil
 	}
 
-	// Directory → single .tar.zst file
-	outPath := base + "." + ts + ".tar.zst"
+	// Directory → single .zip file using parallel compression
+	outPath := base + "." + ts + ".zip"
 	if dir != "." && dir != "" {
-		outPath = filepath.Join(dir, base+"."+ts+".tar.zst")
+		outPath = filepath.Join(dir, base+"."+ts+".zip")
 	}
 
 	orig := calculateSize(input)
@@ -161,25 +174,21 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 		}
 	}()
 
-	zw, err := zstd.NewWriter(outFile,
-		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		zstd.WithEncoderConcurrency(coresPerJob),
-	)
-	if err != nil {
-		return err
-	}
-	defer zw.Close()
+	zw := kzip.NewWriter(outFile)
 
-	tw := tar.NewWriter(zw)
-	if err := addToTar(ctx, tw, input, base, verbose, coresPerJob); err != nil {
-		tw.Close()
-		return err
+	// Register fast deflate compressor
+	zw.RegisterCompressor(kzip.Deflate, func(w io.Writer) (io.WriteCloser, error) {
+		return flate.NewWriter(w, flate.BestSpeed)
+	})
+
+	// Parallel read + compress into zip
+	if addErr := addToZip(zw, input, base, verbose, coresPerJob); addErr != nil {
+		zw.Close()
+		return addErr
 	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if err := zw.Close(); err != nil {
-		return err
+
+	if zerr := zw.Close(); zerr != nil {
+		return zerr
 	}
 
 	var compSize int64
@@ -190,19 +199,24 @@ func backup(ctx context.Context, input, ts string, verbose bool, coresPerJob int
 	return nil
 }
 
-// Parallel tar writer (raw data → outer zstd does the compression)
+// job and result for parallel zip compression (pre-compress files in workers for parallelism).
 type job struct {
 	path string
 	rel  string
 }
 
 type result struct {
-	hdr  *tar.Header
+	hdr  *kzip.FileHeader
 	data []byte
 	err  error
 }
 
-func addToTar(ctx context.Context, tw *tar.Writer, sourcePath, archiveBase string, verbose bool, coresPerJob int) error {
+// addToZip walks the source tree, reads + compresses files in parallel workers (using coresPerJob),
+// then writes them sequentially into the zip archive (zip writing is inherently sequential due to central directory).
+//
+// This provides parallel compression while producing a standard .zip file that can be opened directly
+// by unzip, 7z, Windows Explorer, etc. without any special unpacking step.
+func addToZip(zw *kzip.Writer, sourcePath, archiveBase string, verbose bool, coresPerJob int) error {
 	numWorkers := coresPerJob
 	if numWorkers < 1 {
 		numWorkers = 1
@@ -211,60 +225,64 @@ func addToTar(ctx context.Context, tw *tar.Writer, sourcePath, archiveBase strin
 	jobs := make(chan job, 512)
 	results := make(chan result, 64)
 
-	var wg sync.WaitGroup
+	// Limit concurrent in-memory compressed data for memory safety on large dirs.
+	maxInFlight := 8
+	if numWorkers < maxInFlight {
+		maxInFlight = numWorkers
+	}
+	inFlight := make(chan struct{}, maxInFlight)
+
+	var readerWG sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
+		readerWG.Add(1)
 		go func() {
-			defer wg.Done()
+			defer readerWG.Done()
 			for j := range jobs {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
+				inFlight <- struct{}{}
 
 				raw, err := os.ReadFile(j.path)
 				if err != nil {
+					<-inFlight
 					results <- result{err: err}
 					continue
 				}
-				// Security: sanitize path to prevent tar slip / path traversal.
-				// We reject any path component that is ".." or absolute.
-				cleanRel := filepath.ToSlash(j.rel)
-				if strings.HasPrefix(cleanRel, "/") || strings.Contains(cleanRel, "../") {
-					results <- result{err: fmt.Errorf("refusing to archive path with .. or absolute component: %s", j.rel)}
+
+				// Pre-compress in parallel for speed (this is the "parallel zip" part)
+				var buf bytes.Buffer
+				fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
+				fw.Write(raw)
+				fw.Close()
+
+				hdr := &kzip.FileHeader{
+					Name:   j.rel, // direct contents, no extra folder wrapper (the zip filename carries the identity)
+					Method: kzip.Deflate,
+				}
+				hdr.SetModTime(time.Now())
+
+				// Optimization: store instead of compress for already-compressed files
+				if shouldStoreRaw(j.path) {
+					hdr.Method = kzip.Store
+					results <- result{hdr: hdr, data: raw}
+					<-inFlight
 					continue
 				}
 
-				hdr := &tar.Header{
-					Name:    filepath.Join(archiveBase, cleanRel),
-					ModTime: time.Now(),
-					Size:    int64(len(raw)),
-					Mode:    0644,
-				}
-				results <- result{hdr: hdr, data: raw}
+				results <- result{hdr: hdr, data: buf.Bytes()}
+				<-inFlight
 			}
 		}()
 	}
 
-	// Parallel directory walking
+	// Dispatcher with parallel directory walking
 	go func() {
 		var walkWG sync.WaitGroup
-		var walkDir func(string)
+
+		var walkDir func(dir string)
 		walkDir = func(dir string) {
 			defer walkWG.Done()
 
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
 			ents, err := os.ReadDir(dir)
 			if err != nil {
-				// We can't easily propagate this error from inside the goroutine without
-				// a more complex error channel. For now we silently skip the directory.
-				// In a production tool you would want to collect such errors.
 				return
 			}
 			for _, e := range ents {
@@ -278,6 +296,7 @@ func addToTar(ctx context.Context, tw *tar.Writer, sourcePath, archiveBase strin
 				}
 			}
 		}
+
 		walkWG.Add(1)
 		go walkDir(sourcePath)
 		walkWG.Wait()
@@ -285,24 +304,31 @@ func addToTar(ctx context.Context, tw *tar.Writer, sourcePath, archiveBase strin
 	}()
 
 	go func() {
-		wg.Wait()
+		readerWG.Wait()
 		close(results)
 	}()
 
+	// Write sequentially to zip (required by format)
+	count := 0
 	for r := range results {
 		if r.err != nil {
 			return r.err
 		}
-		if err := tw.WriteHeader(r.hdr); err != nil {
+
+		w, err := zw.CreateHeader(r.hdr)
+		if err != nil {
 			return err
 		}
-		if _, err := tw.Write(r.data); err != nil {
+		if _, err := w.Write(r.data); err != nil {
 			return err
 		}
+
 		if verbose {
 			fmt.Println(r.hdr.Name)
 		}
+		count++
 	}
+
 	return nil
 }
 
@@ -351,6 +377,76 @@ func copyFileWithTimestamp(src, dst string, info os.FileInfo) error {
 	}
 	os.Chtimes(dst, info.ModTime(), info.ModTime())
 	return nil
+}
+
+// extractZip extracts a standard .zip archive to the current directory.
+// It logs errors for individual files but continues to the next file in the archive.
+func extractZip(archivePath string, verbose bool) error {
+	r, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip %s: %w", archivePath, err)
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if err := extractZipFile(f, verbose); err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting %s from %s: %v\n", f.Name, archivePath, err)
+			// continue to next file
+		}
+	}
+	return nil
+}
+
+func extractZipFile(f *zip.File, verbose bool) error {
+	// Prevent zip slip
+	if strings.Contains(f.Name, "..") {
+		return fmt.Errorf("refusing to extract path with .. : %s", f.Name)
+	}
+
+	if verbose {
+		fmt.Println(f.Name)
+	}
+
+	// Create directories if needed
+	if f.FileInfo().IsDir() {
+		return os.MkdirAll(f.Name, f.FileInfo().Mode())
+	}
+
+	if err := os.MkdirAll(filepath.Dir(f.Name), 0755); err != nil {
+		return err
+	}
+
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	out, err := os.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, rc)
+	return err
+}
+
+// shouldStoreRaw returns true for file types that are typically already compressed
+// (PDFs, images, archives, etc.). For these, we use ZIP Store method instead of Deflate
+// for maximum speed and often better or equal size.
+func shouldStoreRaw(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar",
+		".mp3", ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flac", ".ogg", ".docx", ".xlsx", ".pptx":
+		return true
+	}
+	// Very small files: not worth compressing
+	if info, err := os.Stat(path); err == nil && info.Size() < 4096 {
+		return true
+	}
+	return false
 }
 
 // wrapTargetError wraps an error with the original queue entry name so that

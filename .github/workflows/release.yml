@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build binary
+        run: |
+          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
+            go build -ldflags="-s -w" -o go-bkp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-bkp-${{ matrix.os }}-${{ matrix.arch }}
+          path: go-bkp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum go-bkp-* > SHA256SUMS.txt
+          ls -la
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/go-bkp-*
+            artifacts/SHA256SUMS.txt
+          # The release that triggered this workflow will receive the assets
+          # If you want to draft releases, set draft: true in the release creation
